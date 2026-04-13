@@ -1,6 +1,8 @@
 mod auth;
+mod chatgpt_api;
 mod cli;
 mod commands;
+mod display;
 mod model;
 mod registry;
 mod sessions;

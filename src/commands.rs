@@ -1,14 +1,18 @@
 use crate::auth::parse_auth_info;
+use crate::chatgpt_api::{self, DEFAULT_ACCOUNT_ENDPOINT};
 use crate::cli::{
     Command, ConfigApiArgs, ConfigAutoArgs, ConfigCommand, ConfigToggle, DaemonArgs, ImportArgs,
     LoginArgs, RemoveArgs, SwitchArgs,
 };
+use crate::display::{
+    build_display_rows, display_plan, format_last_activity, format_rate_limit_ui, resolve_rate_window,
+};
 use crate::model::{AccountRecord, RateLimitSnapshot, Registry};
 use crate::registry::{
-    ImportOutcome, Paths, account_auth_path, account_from_auth, activate_account_by_key,
-    active_auth_path, clean_accounts_dir, find_matching_accounts, import_cpa_path,
-    import_standard_path, load_registry, purge_registry_from_path, remove_accounts, resolve_paths,
-    save_registry, select_best_account_key_by_usage, set_active_account_key,
+    ImportOutcome, Paths, account_auth_path, account_from_auth, activate_account_by_key, active_auth_path,
+    apply_account_names_for_user, clean_accounts_dir, find_matching_accounts, import_cpa_path,
+    import_standard_path, load_active_auth_info, load_registry, purge_registry_from_path, remove_accounts,
+    resolve_paths, save_registry, select_best_account_key_by_usage, set_active_account_key,
     sync_active_account_from_auth, update_account_usage, update_plan_from_usage, upsert_account,
 };
 use crate::sessions::scan_latest_usage;
@@ -37,6 +41,7 @@ fn list_accounts(paths: &Paths) -> Result<()> {
     let mut registry = load_registry(paths)?;
     let mut dirty = sync_active_account_from_auth(paths, &mut registry)?;
     dirty |= refresh_active_usage(paths, &mut registry)?;
+    dirty |= refresh_active_account_names(paths, &mut registry)?;
     dirty |= update_plan_from_usage(&mut registry);
     if dirty {
         save_registry(paths, &registry)?;
@@ -47,41 +52,12 @@ fn list_accounts(paths: &Paths) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<2} {:<32} {:<12} {:<12} {:<18} {:<8}",
-        "", "ACCOUNT", "ALIAS", "PLAN", "LAST", "ACTIVE"
-    );
-    for record in &registry.accounts {
-        println!(
-            "{:<2} {:<32} {:<12} {:<12} {:<18} {:<8}",
-            if registry.active_account_key.as_deref() == Some(record.account_key.as_str()) {
-                "*"
-            } else {
-                ""
-            },
-            display_account(record),
-            truncate(&record.alias, 12),
-            record
-                .plan
-                .map(|plan| plan.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            format_last_seen(record.last_usage_at),
-            if registry.active_account_key.as_deref() == Some(record.account_key.as_str()) {
-                "yes"
-            } else {
-                ""
-            },
-        );
-    }
+    render_accounts_table(&registry);
     Ok(())
 }
 
 fn login(paths: &Paths, args: LoginArgs) -> Result<()> {
-    let mut command = ProcessCommand::new("codex");
-    command.arg("login");
-    if args.device_auth {
-        command.arg("--device-auth");
-    }
+    let mut command = build_codex_login_command(args.device_auth);
     let status = command.status().context("failed to launch `codex login`")?;
     if !status.success() {
         bail!("`codex login` failed");
@@ -100,6 +76,34 @@ fn login(paths: &Paths, args: LoginArgs) -> Result<()> {
     save_registry(paths, &registry)?;
     println!("added {}", info.email.unwrap_or_else(|| record_key.clone()));
     Ok(())
+}
+
+fn build_codex_login_command(device_auth: bool) -> ProcessCommand {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = ProcessCommand::new("powershell.exe");
+        command.arg("-NoLogo");
+        command.arg("-NoProfile");
+        command.arg("-ExecutionPolicy");
+        command.arg("Bypass");
+        command.arg("-Command");
+        command.arg(if device_auth {
+            "codex login --device-auth"
+        } else {
+            "codex login"
+        });
+        command
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = ProcessCommand::new("codex");
+        command.arg("login");
+        if device_auth {
+            command.arg("--device-auth");
+        }
+        command
+    }
 }
 
 fn import_accounts(paths: &Paths, args: ImportArgs) -> Result<()> {
@@ -208,6 +212,7 @@ fn status(paths: &Paths) -> Result<()> {
     let mut registry = load_registry(paths)?;
     let mut dirty = sync_active_account_from_auth(paths, &mut registry)?;
     dirty |= refresh_active_usage(paths, &mut registry)?;
+    dirty |= refresh_active_account_names(paths, &mut registry)?;
     if dirty {
         save_registry(paths, &registry)?;
     }
@@ -221,6 +226,14 @@ fn status(paths: &Paths) -> Result<()> {
     println!(
         "api: usage={}, account={}",
         registry.api.usage, registry.api.account
+    );
+    println!(
+        "runtime: {}",
+        if registry.auto_switch.enabled {
+            "watch/daemon expected"
+        } else {
+            "stopped"
+        }
     );
     if let Some(active) = registry.active_account() {
         println!("active: {}", display_account(active));
@@ -301,6 +314,7 @@ fn config_api(registry: &mut Registry, args: ConfigApiArgs) {
 fn daemon_once(paths: &Paths, registry: &mut Registry) -> Result<()> {
     let _ = sync_active_account_from_auth(paths, registry)?;
     let _ = refresh_active_usage(paths, registry)?;
+    let _ = refresh_active_account_names(paths, registry)?;
     if !registry.auto_switch.enabled {
         return Ok(());
     }
@@ -331,8 +345,26 @@ fn refresh_active_usage(paths: &Paths, registry: &mut Registry) -> Result<bool> 
     let Some(active_key) = registry.active_account_key.clone() else {
         return Ok(false);
     };
-    let Some(latest) = scan_latest_usage(&paths.codex_home)? else {
-        return Ok(false);
+    let latest = if registry.api.usage {
+        match chatgpt_api::fetch_usage_for_auth_path(&active_auth_path(paths)) {
+            Ok(result) => result.snapshot.map(|snapshot| (snapshot, "api".to_owned(), now_ms())),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let (snapshot, source_path, event_timestamp_ms) = if let Some(result) = latest {
+        result
+    } else {
+        let Some(latest) = scan_latest_usage(&paths.codex_home)? else {
+            return Ok(false);
+        };
+        (
+            latest.snapshot,
+            latest.path.display().to_string(),
+            latest.event_timestamp_ms,
+        )
     };
 
     let already_applied = registry
@@ -341,8 +373,7 @@ fn refresh_active_usage(paths: &Paths, registry: &mut Registry) -> Result<bool> 
         .find(|record| record.account_key == active_key)
         .and_then(|record| record.last_local_rollout.as_ref())
         .is_some_and(|rollout| {
-            rollout.event_timestamp_ms == latest.event_timestamp_ms
-                && rollout.path == latest.path.display().to_string()
+            rollout.event_timestamp_ms == event_timestamp_ms && rollout.path == source_path
         });
     if already_applied {
         return Ok(false);
@@ -351,12 +382,41 @@ fn refresh_active_usage(paths: &Paths, registry: &mut Registry) -> Result<bool> 
     let changed = update_account_usage(
         registry,
         &active_key,
-        latest.snapshot,
-        latest.event_timestamp_ms,
-        latest.path.display().to_string(),
-        latest.event_timestamp_ms,
+        snapshot,
+        event_timestamp_ms,
+        source_path,
+        event_timestamp_ms,
     );
     Ok(changed)
+}
+
+fn refresh_active_account_names(paths: &Paths, registry: &mut Registry) -> Result<bool> {
+    if !registry.api.account {
+        return Ok(false);
+    }
+    let Some(info) = load_active_auth_info(paths)? else {
+        return Ok(false);
+    };
+    let (Some(access_token), Some(account_id), Some(user_id)) = (
+        info.access_token.as_deref(),
+        info.chatgpt_account_id.as_deref(),
+        info.chatgpt_user_id.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+
+    let result = match chatgpt_api::fetch_accounts_for_token(DEFAULT_ACCOUNT_ENDPOINT, access_token, account_id) {
+        Ok(result) => result,
+        Err(_) => return Ok(false),
+    };
+    let Some(entries) = result.entries else {
+        return Ok(false);
+    };
+    let mapped = entries
+        .into_iter()
+        .map(|entry| (entry.account_id, entry.account_name))
+        .collect::<Vec<_>>();
+    Ok(apply_account_names_for_user(registry, user_id, &mapped))
 }
 
 fn select_from_matches(matches: &[&AccountRecord]) -> Result<String> {
@@ -387,6 +447,35 @@ fn print_import_report(report: &crate::registry::ImportReport) {
     );
 }
 
+fn render_accounts_table(registry: &Registry) {
+    let rows = build_display_rows(registry, None);
+    println!(
+        "{:<5} {:<32} {:<12} {:<18} {:<18} {:<14}",
+        "", "ACCOUNT", "PLAN", "5H USAGE", "WEEKLY USAGE", "LAST ACTIVITY"
+    );
+    for (row_index, row) in rows.iter().enumerate() {
+        if let Some(account_index) = row.account_index {
+            let record = &registry.accounts[account_index];
+            let indent = "  ".repeat(row.depth as usize);
+            println!(
+                "{:<5} {:<32} {:<12} {:<18} {:<18} {:<14}",
+                if row.is_active {
+                    format!("*{:02}", row_index + 1)
+                } else {
+                    format!("{:02}", row_index + 1)
+                },
+                truncate(&(indent + &row.account_cell), 32),
+                display_plan(record),
+                truncate(&format_rate_limit_ui(resolve_rate_window(record.last_usage.as_ref(), 300, true)), 18),
+                truncate(&format_rate_limit_ui(resolve_rate_window(record.last_usage.as_ref(), 10080, false)), 18),
+                format_last_activity(record.last_usage_at),
+            );
+        } else {
+            println!("{:<5} {}", "", row.account_cell);
+        }
+    }
+}
+
 fn display_account(record: &AccountRecord) -> String {
     if record.alias.is_empty() {
         truncate(&record.email, 32)
@@ -400,15 +489,6 @@ fn truncate(value: &str, max: usize) -> String {
         return value.to_owned();
     }
     value.chars().take(max.saturating_sub(1)).collect::<String>() + "."
-}
-
-fn format_last_seen(value: Option<i64>) -> String {
-    match value {
-        Some(value) => chrono::DateTime::from_timestamp(value, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "-".to_owned()),
-        None => "-".to_owned(),
-    }
 }
 
 fn format_usage_summary(usage: Option<&RateLimitSnapshot>) -> String {
@@ -434,4 +514,11 @@ fn validate_percent(value: u8, flag: &str) -> Result<()> {
     } else {
         bail!("{flag} must be between 1 and 100")
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }

@@ -418,6 +418,28 @@ pub fn update_plan_from_usage(registry: &mut Registry) -> bool {
     changed
 }
 
+pub fn apply_account_names_for_user(
+    registry: &mut Registry,
+    chatgpt_user_id: &str,
+    entries: &[(String, Option<String>)],
+) -> bool {
+    let mut changed = false;
+    for record in &mut registry.accounts {
+        if record.chatgpt_user_id != chatgpt_user_id {
+            continue;
+        }
+        let next_name = entries
+            .iter()
+            .find(|(account_id, _)| account_id == &record.chatgpt_account_id)
+            .and_then(|(_, name)| name.clone());
+        if record.account_name != next_name {
+            record.account_name = next_name;
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn import_path_impl(
     paths: &Paths,
     registry: &mut Registry,
