@@ -10,8 +10,8 @@ use std::time::Duration;
 pub const DEFAULT_USAGE_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub const DEFAULT_ACCOUNT_ENDPOINT: &str =
     "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
-const BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+pub const DEFAULT_ME_ENDPOINT: &str = "https://api.openai.com/v1/me";
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -32,6 +32,12 @@ pub struct AccountEntry {
 pub struct AccountFetchResult {
     pub entries: Option<Vec<AccountEntry>>,
     pub status_code: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeFetchResult {
+    pub user_id: String,
+    pub email: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,9 +72,17 @@ struct AccountsResponse {
     accounts: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MeResponse {
+    id: Option<String>,
+    user_id: Option<String>,
+    email: Option<String>,
+}
+
 pub fn fetch_usage_for_auth_path(auth_path: &Path) -> Result<UsageFetchResult> {
     let info = parse_auth_info(auth_path)?;
-    let (Some(access_token), Some(account_id)) = (info.access_token, info.chatgpt_account_id) else {
+    let (Some(access_token), Some(account_id)) = (info.access_token, info.chatgpt_account_id)
+    else {
         return Ok(UsageFetchResult {
             snapshot: None,
             status_code: None,
@@ -78,7 +92,11 @@ pub fn fetch_usage_for_auth_path(auth_path: &Path) -> Result<UsageFetchResult> {
     fetch_usage_for_token(DEFAULT_USAGE_ENDPOINT, &access_token, &account_id)
 }
 
-pub fn fetch_usage_for_token(endpoint: &str, access_token: &str, account_id: &str) -> Result<UsageFetchResult> {
+pub fn fetch_usage_for_token(
+    endpoint: &str,
+    access_token: &str,
+    account_id: &str,
+) -> Result<UsageFetchResult> {
     let client = build_client()?;
     let response = client
         .get(endpoint)
@@ -86,7 +104,9 @@ pub fn fetch_usage_for_token(endpoint: &str, access_token: &str, account_id: &st
         .send()
         .context("usage request failed")?;
     let status_code = Some(response.status().as_u16());
-    let body = response.text().context("failed reading usage response body")?;
+    let body = response
+        .text()
+        .context("failed reading usage response body")?;
     if body.trim().is_empty() {
         return Ok(UsageFetchResult {
             snapshot: None,
@@ -102,7 +122,11 @@ pub fn fetch_usage_for_token(endpoint: &str, access_token: &str, account_id: &st
     })
 }
 
-pub fn fetch_accounts_for_token(endpoint: &str, access_token: &str, account_id: &str) -> Result<AccountFetchResult> {
+pub fn fetch_accounts_for_token(
+    endpoint: &str,
+    access_token: &str,
+    account_id: &str,
+) -> Result<AccountFetchResult> {
     let client = build_client()?;
     let response = client
         .get(endpoint)
@@ -110,7 +134,9 @@ pub fn fetch_accounts_for_token(endpoint: &str, access_token: &str, account_id: 
         .send()
         .context("account metadata request failed")?;
     let status_code = Some(response.status().as_u16());
-    let body = response.text().context("failed reading account metadata response body")?;
+    let body = response
+        .text()
+        .context("failed reading account metadata response body")?;
     if body.trim().is_empty() {
         return Ok(AccountFetchResult {
             entries: None,
@@ -123,11 +149,44 @@ pub fn fetch_accounts_for_token(endpoint: &str, access_token: &str, account_id: 
     })
 }
 
+pub fn fetch_me_for_api_key(api_key: &str) -> Result<MeFetchResult> {
+    fetch_me_for_api_key_from_endpoint(DEFAULT_ME_ENDPOINT, api_key)
+}
+
+pub fn fetch_me_for_api_key_from_endpoint(endpoint: &str, api_key: &str) -> Result<MeFetchResult> {
+    let client = build_client()?;
+    let response = client
+        .get(endpoint)
+        .headers(build_bearer_headers(api_key)?)
+        .send()
+        .context("OpenAI /v1/me request failed")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed reading OpenAI /v1/me response body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "OpenAI /v1/me request failed with status {}",
+            status.as_u16()
+        );
+    }
+    parse_me_response(&body)
+}
+
 pub fn parse_usage_response(body: &str) -> Result<Option<RateLimitSnapshot>> {
-    let parsed: UsageResponse = serde_json::from_str(body).context("invalid usage response json")?;
+    let parsed: UsageResponse =
+        serde_json::from_str(body).context("invalid usage response json")?;
     let snapshot = RateLimitSnapshot {
-        primary: parsed.rate_limit.as_ref().and_then(|rate| rate.primary_window.as_ref()).map(parse_window),
-        secondary: parsed.rate_limit.as_ref().and_then(|rate| rate.secondary_window.as_ref()).map(parse_window),
+        primary: parsed
+            .rate_limit
+            .as_ref()
+            .and_then(|rate| rate.primary_window.as_ref())
+            .map(parse_window),
+        secondary: parsed
+            .rate_limit
+            .as_ref()
+            .and_then(|rate| rate.secondary_window.as_ref())
+            .map(parse_window),
         credits: parsed.credits.map(|credits| CreditsSnapshot {
             has_credits: credits.has_credits,
             unlimited: credits.unlimited,
@@ -142,7 +201,8 @@ pub fn parse_usage_response(body: &str) -> Result<Option<RateLimitSnapshot>> {
 }
 
 pub fn parse_accounts_response(body: &str) -> Result<Option<Vec<AccountEntry>>> {
-    let parsed: AccountsResponse = serde_json::from_str(body).context("invalid accounts response json")?;
+    let parsed: AccountsResponse =
+        serde_json::from_str(body).context("invalid accounts response json")?;
     let Some(accounts) = parsed.accounts else {
         return Ok(None);
     };
@@ -152,13 +212,13 @@ pub fn parse_accounts_response(body: &str) -> Result<Option<Vec<AccountEntry>>> 
         if key == "default" {
             continue;
         }
-        let Some(account) = value
-            .get("account")
-            .and_then(serde_json::Value::as_object)
-        else {
+        let Some(account) = value.get("account").and_then(serde_json::Value::as_object) else {
             continue;
         };
-        let Some(account_id) = account.get("account_id").and_then(serde_json::Value::as_str) else {
+        let Some(account_id) = account
+            .get("account_id")
+            .and_then(serde_json::Value::as_str)
+        else {
             continue;
         };
         if account_id.is_empty() {
@@ -176,6 +236,22 @@ pub fn parse_accounts_response(body: &str) -> Result<Option<Vec<AccountEntry>>> 
     }
 
     Ok(Some(entries))
+}
+
+pub fn parse_me_response(body: &str) -> Result<MeFetchResult> {
+    let parsed: MeResponse =
+        serde_json::from_str(body).context("invalid OpenAI /v1/me response json")?;
+    let user_id = parsed
+        .id
+        .or(parsed.user_id)
+        .filter(|value| !value.is_empty())
+        .context("OpenAI /v1/me response is missing user id")?;
+    let email = parsed
+        .email
+        .filter(|value| !value.is_empty())
+        .context("OpenAI /v1/me response is missing email")?
+        .to_ascii_lowercase();
+    Ok(MeFetchResult { user_id, email })
 }
 
 fn build_client() -> Result<Client> {
@@ -199,6 +275,16 @@ fn build_headers(access_token: &str, account_id: &str) -> Result<HeaderMap> {
     Ok(headers)
 }
 
+fn build_bearer_headers(token: &str) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).context("invalid auth header")?,
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_USER_AGENT));
+    Ok(headers)
+}
+
 fn parse_window(window: &ApiWindowJson) -> RateLimitWindow {
     RateLimitWindow {
         used_percent: window.used_percent,
@@ -215,6 +301,7 @@ fn parse_plan_type(value: &str) -> PlanType {
     match value.to_ascii_lowercase().as_str() {
         "free" => PlanType::Free,
         "plus" => PlanType::Plus,
+        "prolite" => PlanType::Prolite,
         "pro" => PlanType::Pro,
         "team" => PlanType::Team,
         "business" => PlanType::Business,

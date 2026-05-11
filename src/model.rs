@@ -1,15 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
-pub const DEFAULT_AUTO_SWITCH_THRESHOLD_5H_PERCENT: u8 = 10;
-pub const DEFAULT_AUTO_SWITCH_THRESHOLD_WEEKLY_PERCENT: u8 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+pub const DEFAULT_AUTO_SWITCH_THRESHOLD_5H_PERCENT: u8 = 1;
+pub const DEFAULT_AUTO_SWITCH_THRESHOLD_WEEKLY_PERCENT: u8 = 1;
+pub const DEFAULT_LIVE_REFRESH_INTERVAL_SECONDS: u16 = 60;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanType {
     Free,
     Plus,
+    Prolite,
     Pro,
     Team,
     Business,
@@ -23,6 +26,7 @@ impl Display for PlanType {
         f.write_str(match self {
             Self::Free => "free",
             Self::Plus => "plus",
+            Self::Prolite => "prolite",
             Self::Pro => "pro",
             Self::Team => "team",
             Self::Business => "business",
@@ -91,6 +95,19 @@ pub struct ApiConfig {
     pub account: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveConfig {
+    pub interval_seconds: u16,
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: DEFAULT_LIVE_REFRESH_INTERVAL_SECONDS,
+        }
+    }
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -128,6 +145,8 @@ pub struct Registry {
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
+    pub live: LiveConfig,
+    #[serde(default)]
     pub accounts: Vec<AccountRecord>,
 }
 
@@ -139,6 +158,7 @@ impl Default for Registry {
             active_account_activated_at_ms: None,
             auto_switch: AutoSwitchConfig::default(),
             api: ApiConfig::default(),
+            live: LiveConfig::default(),
             accounts: Vec::new(),
         }
     }
@@ -147,6 +167,8 @@ impl Default for Registry {
 impl Registry {
     pub fn active_account(&self) -> Option<&AccountRecord> {
         let key = self.active_account_key.as_ref()?;
-        self.accounts.iter().find(|record| &record.account_key == key)
+        self.accounts
+            .iter()
+            .find(|record| &record.account_key == key)
     }
 }

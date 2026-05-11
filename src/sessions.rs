@@ -138,6 +138,7 @@ fn parse_plan_type(value: &str) -> PlanType {
     match value.to_ascii_lowercase().as_str() {
         "free" => PlanType::Free,
         "plus" => PlanType::Plus,
+        "prolite" => PlanType::Prolite,
         "pro" => PlanType::Pro,
         "team" => PlanType::Team,
         "business" => PlanType::Business,

@@ -137,6 +137,7 @@ fn plan_sort_rank(record: &AccountRecord) -> u8 {
         | Some(crate::model::PlanType::Edu) => 0,
         Some(crate::model::PlanType::Free)
         | Some(crate::model::PlanType::Plus)
+        | Some(crate::model::PlanType::Prolite)
         | Some(crate::model::PlanType::Pro) => 1,
         _ => 2,
     }

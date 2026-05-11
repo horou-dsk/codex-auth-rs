@@ -9,7 +9,7 @@ use crate::display::{
 };
 use crate::model::{AccountRecord, RateLimitSnapshot, Registry};
 use crate::registry::{
-    ImportOutcome, Paths, account_auth_path, account_from_auth, activate_account_by_key, active_auth_path,
+    ImportOutcome, Paths, account_auth_path, account_from_auth_info, activate_account_by_key, active_auth_path,
     apply_account_names_for_user, clean_accounts_dir, find_matching_accounts, import_cpa_path,
     import_standard_path, load_active_auth_info, load_registry, purge_registry_from_path, remove_accounts,
     resolve_paths, save_registry, select_best_account_key_by_usage, set_active_account_key,
@@ -66,13 +66,12 @@ fn login(paths: &Paths, args: LoginArgs) -> Result<()> {
     let auth_path = active_auth_path(paths);
     let info = parse_auth_info(&auth_path)?;
     let mut registry = load_registry(paths)?;
-    let Some(record_key) = info.record_key.as_ref() else {
-        bail!("active auth is missing record key");
-    };
-    std::fs::copy(&auth_path, account_auth_path(paths, record_key))
+    let record = account_from_auth_info("", &info)?;
+    let record_key = record.account_key.clone();
+    crate::registry::copy_managed_file(&auth_path, &account_auth_path(paths, &record_key))
         .with_context(|| format!("failed storing snapshot for `{record_key}`"))?;
-    let _ = upsert_account(&mut registry, account_from_auth("", &info)?)?;
-    set_active_account_key(&mut registry, record_key);
+    let _ = upsert_account(&mut registry, record)?;
+    set_active_account_key(&mut registry, &record_key);
     save_registry(paths, &registry)?;
     println!("added {}", info.email.unwrap_or_else(|| record_key.clone()));
     Ok(())

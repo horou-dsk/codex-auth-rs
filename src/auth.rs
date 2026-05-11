@@ -15,6 +15,7 @@ pub struct AuthInfo {
     pub chatgpt_user_id: Option<String>,
     pub record_key: Option<String>,
     pub access_token: Option<String>,
+    pub openai_api_key: Option<String>,
     pub last_refresh: Option<String>,
     pub plan: Option<PlanType>,
     pub auth_mode: AuthMode,
@@ -66,14 +67,21 @@ pub fn parse_auth_info_data(data: &[u8]) -> Result<AuthInfo> {
     if obj
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
-        .is_some_and(|key| !key.is_empty())
+        .is_some_and(|key| !key.trim().is_empty())
     {
+        let openai_api_key = obj
+            .get("OPENAI_API_KEY")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(ToOwned::to_owned);
         return Ok(AuthInfo {
             email: None,
             chatgpt_account_id: None,
             chatgpt_user_id: None,
             record_key: None,
             access_token: None,
+            openai_api_key,
             last_refresh: None,
             plan: None,
             auth_mode: AuthMode::Apikey,
@@ -103,26 +111,38 @@ pub fn parse_auth_info_data(data: &[u8]) -> Result<AuthInfo> {
 
     if let Some(id_token) = id_token {
         let payload = decode_jwt_payload(id_token)?;
-        let claims: JwtClaims = serde_json::from_slice(&payload).context("invalid jwt payload json")?;
+        let claims: JwtClaims =
+            serde_json::from_slice(&payload).context("invalid jwt payload json")?;
         let email = claims.email.map(|s| s.to_ascii_lowercase());
         let auth = claims.auth;
-        let jwt_account_id = auth.as_ref().and_then(|auth| auth.chatgpt_account_id.clone());
+        let jwt_account_id = auth
+            .as_ref()
+            .and_then(|auth| auth.chatgpt_account_id.clone());
         let plan = auth
             .as_ref()
             .and_then(|auth| auth.chatgpt_plan_type.as_deref())
             .map(parse_plan_type);
-        let chatgpt_user_id = auth
-            .as_ref()
-            .and_then(|auth| auth.chatgpt_user_id.clone().or_else(|| auth.user_id.clone()));
+        let chatgpt_user_id = auth.as_ref().and_then(|auth| {
+            auth.chatgpt_user_id
+                .clone()
+                .or_else(|| auth.user_id.clone())
+        });
 
-        match (account_id.as_deref(), jwt_account_id.as_deref(), chatgpt_user_id.as_deref()) {
-            (Some(token_account_id), Some(jwt_account_id), Some(user_id)) if token_account_id == jwt_account_id => {
+        match (
+            account_id.as_deref(),
+            jwt_account_id.as_deref(),
+            chatgpt_user_id.as_deref(),
+        ) {
+            (Some(token_account_id), Some(jwt_account_id), Some(user_id))
+                if token_account_id == jwt_account_id =>
+            {
                 return Ok(AuthInfo {
                     email,
                     chatgpt_account_id: account_id.clone(),
                     chatgpt_user_id: chatgpt_user_id.clone(),
                     record_key: Some(format!("{user_id}::{token_account_id}")),
                     access_token,
+                    openai_api_key: None,
                     last_refresh,
                     plan,
                     auth_mode: AuthMode::Chatgpt,
@@ -138,6 +158,7 @@ pub fn parse_auth_info_data(data: &[u8]) -> Result<AuthInfo> {
         chatgpt_user_id: None,
         record_key: None,
         access_token,
+        openai_api_key: None,
         last_refresh,
         plan: None,
         auth_mode: AuthMode::Chatgpt,
@@ -189,6 +210,7 @@ fn parse_plan_type(value: &str) -> PlanType {
     match value.to_ascii_lowercase().as_str() {
         "free" => PlanType::Free,
         "plus" => PlanType::Plus,
+        "prolite" => PlanType::Prolite,
         "pro" => PlanType::Pro,
         "team" => PlanType::Team,
         "business" => PlanType::Business,
