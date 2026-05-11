@@ -146,10 +146,16 @@ fn switch_account(paths: &Paths, args: SwitchArgs) -> Result<()> {
         match matches.len() {
             0 => bail!("account not found: {query}"),
             1 => matches[0].account_key.clone(),
-            _ => select_from_matches(&matches)?,
+            _ => match select_from_matches(&matches)? {
+                Some(key) => key,
+                None => return Ok(()),
+            },
         }
     } else {
-        select_from_matches(&registry.accounts.iter().collect::<Vec<_>>())?
+        match select_from_matches(&registry.accounts.iter().collect::<Vec<_>>())? {
+            Some(key) => key,
+            None => return Ok(()),
+        }
     };
 
     activate_account_by_key(paths, &mut registry, &selected_key)?;
@@ -177,8 +183,13 @@ fn remove_account(paths: &Paths, args: RemoveArgs) -> Result<()> {
             bail!("account not found: {query}");
         }
         if matches.len() > 1 {
+            let labels = build_account_selection_labels(&matches);
             let confirmed = Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt(format!("remove {} matched accounts?", matches.len()))
+                .with_prompt(format!(
+                    "remove {} matched accounts: {}?",
+                    matches.len(),
+                    labels.join(", ")
+                ))
                 .default(false)
                 .interact()?;
             if !confirmed {
@@ -187,11 +198,15 @@ fn remove_account(paths: &Paths, args: RemoveArgs) -> Result<()> {
         }
         matches.into_iter().map(|record| record.account_key.clone()).collect()
     } else {
-        let labels = registry.accounts.iter().map(display_account).collect::<Vec<_>>();
+        let accounts = registry.accounts.iter().collect::<Vec<_>>();
+        let labels = build_account_selection_labels(&accounts);
         let selection = MultiSelect::with_theme(&ColorfulTheme::default())
-            .with_prompt("select accounts to remove")
+            .with_prompt("select accounts to remove (q to quit)")
             .items(&labels)
-            .interact()?;
+            .interact_opt()?;
+        let Some(selection) = selection else {
+            return Ok(());
+        };
         selection
             .into_iter()
             .map(|index| registry.accounts[index].account_key.clone())
@@ -419,14 +434,14 @@ fn refresh_active_account_names(paths: &Paths, registry: &mut Registry) -> Resul
     Ok(apply_account_names_for_user(registry, user_id, &mapped))
 }
 
-fn select_from_matches(matches: &[&AccountRecord]) -> Result<String> {
-    let labels = matches.iter().map(|record| display_account(record)).collect::<Vec<_>>();
-    let index = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("select account")
+fn select_from_matches(matches: &[&AccountRecord]) -> Result<Option<String>> {
+    let labels = build_account_selection_labels(matches);
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("select account (q to quit)")
         .items(&labels)
         .default(0)
-        .interact()?;
-    Ok(matches[index].account_key.clone())
+        .interact_opt()?;
+    Ok(selection.map(|index| matches[index].account_key.clone()))
 }
 
 fn print_import_report(report: &crate::registry::ImportReport) {
@@ -484,11 +499,73 @@ fn display_account(record: &AccountRecord) -> String {
     }
 }
 
+fn build_account_selection_labels(matches: &[&AccountRecord]) -> Vec<String> {
+    matches
+        .iter()
+        .enumerate()
+        .map(|(index, record)| display_account_selection_label(record, matches, index))
+        .collect()
+}
+
+fn display_account_selection_label(
+    record: &AccountRecord,
+    matches: &[&AccountRecord],
+    index: usize,
+) -> String {
+    let duplicate_email_count = matches
+        .iter()
+        .filter(|candidate| candidate.email == record.email)
+        .count();
+    if duplicate_email_count <= 1 {
+        return display_account(record);
+    }
+
+    let plan = display_plan(record);
+    let duplicate_plan_count = matches
+        .iter()
+        .filter(|candidate| candidate.email == record.email && display_plan(candidate) == plan)
+        .count();
+    let suffix = if duplicate_plan_count <= 1 {
+        plan
+    } else {
+        let ordinal = matches[..index]
+            .iter()
+            .filter(|candidate| candidate.email == record.email && display_plan(candidate) == plan)
+            .count()
+            + 1;
+        format!("{plan} #{ordinal}")
+    };
+
+    if record.alias.is_empty() {
+        truncate_with_suffix(&record.email, &format!(" ({suffix})"), 32)
+    } else {
+        truncate_with_suffix(
+            &format!("{} ({})", record.email, record.alias),
+            &format!(", {suffix})"),
+            32,
+        )
+    }
+}
+
 fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_owned();
     }
     value.chars().take(max.saturating_sub(1)).collect::<String>() + "."
+}
+
+fn truncate_with_suffix(value: &str, suffix: &str, max: usize) -> String {
+    if value.chars().count() + suffix.chars().count() <= max {
+        return format!("{value}{suffix}");
+    }
+
+    let suffix_len = suffix.chars().count();
+    if suffix_len + 1 >= max {
+        return truncate(&format!("{value}{suffix}"), max);
+    }
+
+    let value_len = max - suffix_len - 1;
+    format!("{}.{suffix}", value.chars().take(value_len).collect::<String>())
 }
 
 fn format_usage_summary(usage: Option<&RateLimitSnapshot>) -> String {
